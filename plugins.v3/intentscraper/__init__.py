@@ -21,7 +21,7 @@ from app.schemas.types import EventType
 from app.sdk.media import resolve_media_identity
 from app.sdk.utilities import SystemUtils
 
-from .library import SCRAPE_ITEMS, LibraryScrapingChain, build_policies, is_trickplay_path
+from .library import SCRAPE_ITEMS, LibraryScrapingChain, build_policies, is_season_folder, is_trickplay_path
 from .mediaserver import MediaServerPersonScraper, RealtimeGuard
 from .network import (
     DEFAULT_IMAGE_DOMAINS, ImageDownloader, check_proxy, parse_domains, parse_proxy, patch_fanart_proxy,
@@ -41,7 +41,7 @@ class IntentScraper(_PluginBase):
     # 插件图标
     plugin_icon = "scraper.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     # 插件作者
     plugin_author = "intent"
     # 作者主页
@@ -996,6 +996,11 @@ class IntentScraper(_PluginBase):
         if is_trickplay_path(file_path):
             return None
 
+        if mtype == MediaType.TV:
+            tv_path = IntentScraper.__get_tv_path(file_path=file_path, scraper_path=scraper_path)
+            if tv_path:
+                return tv_path, mtype, IntentScraper._target_dir, media_source, media_id
+
         rename_format = settings.TV_RENAME_FORMAT if mtype == MediaType.TV else settings.MOVIE_RENAME_FORMAT
         rename_format_level = len(rename_format.strip("/").split("/")) - 1
         try:
@@ -1012,6 +1017,25 @@ class IntentScraper(_PluginBase):
 
         # 扁平目录或自定义重命名格式无目录层级时，退回到单文件刮削，避免分类目录识别失败。
         return file_path, mtype, IntentScraper._target_file, media_source, media_id
+
+    @staticmethod
+    def __get_tv_path(file_path: Path, scraper_path: Path) -> Optional[Path]:
+        """
+        按季目录定位剧集根目录：集文件位于 Season 1、S01、第1季、Specials 等季目录中时，季目录的上一级就是剧集根目录。
+        刮削路径直接指向剧集目录时也按目录整体刮削，才能生成 tvshow.nfo 和 season.nfo；刮削路径本身是季目录时返回该季目录。
+        没有季目录时返回 None，按重命名格式计算。
+        """
+        try:
+            relative_dirs = file_path.parent.relative_to(scraper_path).parts
+        except ValueError:
+            return None
+        folder = file_path.parent
+        # 从集文件所在目录向上查找，最多到刮削路径本身
+        for _ in range(len(relative_dirs) + 1):
+            if is_season_folder(folder.name):
+                return folder if folder == scraper_path else folder.parent
+            folder = folder.parent
+        return None
 
     @staticmethod
     def __contains_scrape_item(
@@ -1079,6 +1103,8 @@ class IntentScraper(_PluginBase):
             nfo_candidates.extend((path / "movie.nfo", path / (path.stem + ".nfo")))
         else:
             nfo_candidates.append(path / "tvshow.nfo")
+            if is_season_folder(path.name):
+                nfo_candidates.append(path.parent / "tvshow.nfo")
         for nfo_path in nfo_candidates:
             if not nfo_path.exists():
                 continue
@@ -1118,23 +1144,37 @@ class IntentScraper(_PluginBase):
         # 获取图片
         self.chain.obtain_images(mediainfo)
         # 刮削
-        item_path = str(path).replace("\\", "/")
-        if target_type == self._target_dir:
-            item_path = f"{item_path}/"
+        overwrite = self._mode == self._mode_force_all
         LibraryScrapingChain().scrape_metadata(
-            fileitem=schemas.FileItem(
-                storage="local",
-                type=target_type,
-                path=item_path,
-                name=path.name,
-                basename=path.stem,
-                extension=path.suffix[1:] if target_type == self._target_file else None,
-                modify_time=path.stat().st_mtime,
-            ),
+            fileitem=self.__local_fileitem(path, target_type),
             mediainfo=mediainfo,
-            overwrite=self._mode == self._mode_force_all
+            overwrite=overwrite
         )
+        if mediainfo.type == MediaType.TV and target_type == self._target_dir and is_season_folder(path.name):
+            # 刮削路径本身是季目录时，补齐剧集根目录的 tvshow.nfo 和图片，不处理其他季
+            LibraryScrapingChain().scrape_metadata(
+                fileitem=self.__local_fileitem(path.parent, self._target_dir),
+                mediainfo=mediainfo,
+                recursive=False,
+                overwrite=overwrite
+            )
         logger.info(f"{path} 刮削完成")
+
+    @classmethod
+    def __local_fileitem(cls, path: Path, target_type: str) -> schemas.FileItem:
+        """生成本地存储的刮削目标。"""
+        item_path = str(path).replace("\\", "/")
+        if target_type == cls._target_dir:
+            item_path = f"{item_path}/"
+        return schemas.FileItem(
+            storage="local",
+            type=target_type,
+            path=item_path,
+            name=path.name,
+            basename=path.stem,
+            extension=path.suffix[1:] if target_type == cls._target_file else None,
+            modify_time=path.stat().st_mtime,
+        )
 
     def __scrape_child_files(self, path: Path, mtype: MediaType):
         """

@@ -3,6 +3,7 @@
 替换为加固的图片下载，并在保存 NFO 前处理其中的演职人员。
 """
 
+import re
 import threading
 from pathlib import Path
 from typing import Iterable, Optional, Union
@@ -10,14 +11,18 @@ from typing import Iterable, Optional, Union
 from app import schemas
 from app.chain.scraping import ScrapingChain, ScrapingConfig
 from app.schemas.types import ScrapingPolicy, ScrapingTarget
+from app.sdk.config import settings
 from app.sdk.logging import logger
-from app.sdk.media import MetaInfo
 
 from .network import ImageDownloader
 from .nfo import NfoActorWriter
 
 # 可刮削的元数据：NFO、海报、背景图、Logo、光盘图、横幅图、缩略图、透明艺术图、横版缩略图
 SCRAPE_ITEMS = ("nfo", "poster", "backdrop", "logo", "disc", "banner", "thumb", "clearart", "landscape")
+
+# 只表示季的目录名：Season 1、S01、第1季、第一季
+_SEASON_FOLDER_RE = re.compile(r"^(?:season|s)[\s._-]*\d{1,4}$|^第\s*[0-9一二三四五六七八九十百零〇两]+\s*季$",
+                               re.IGNORECASE)
 
 
 def build_policies(items: Iterable[str], nfo_overwrite: bool = False) -> ScrapingConfig:
@@ -40,6 +45,18 @@ def build_policies(items: Iterable[str], nfo_overwrite: bool = False) -> Scrapin
         else:
             config[key] = ScrapingPolicy.MISSINGONLY
     return ScrapingConfig(config)
+
+
+def is_season_folder(name: str) -> bool:
+    """
+    是否为只表示季的目录（Season 1、S01、第1季、Specials）。
+    “庆余年 第二季”这类带剧名的目录不算，避免把它的上级分类目录误当成剧集根目录。
+    """
+    if not name:
+        return False
+    if name in (getattr(settings, "RENAME_FORMAT_S0_NAMES", None) or ("Specials", "SPs")):
+        return True
+    return bool(_SEASON_FOLDER_RE.match(name.strip()))
 
 
 def is_trickplay_path(path: Path) -> bool:
@@ -110,8 +127,7 @@ class LibraryScrapingChain(ScrapingChain):
         """
         if item_type != ScrapingTarget.EPISODE:
             return fileitem
-        name = Path(fileitem.path).name
-        if name in self.runtime_config.season_zero_names or MetaInfo(name).begin_season is not None:
+        if is_season_folder(Path(fileitem.path).name):
             return self.storagechain.get_parent_item(fileitem) or fileitem
         return fileitem
 
