@@ -1,8 +1,7 @@
 """
 演职人员信息解析：从 TMDB 和豆瓣获取中文名称、饰演角色、简介和头像地址。
 
-这里只负责“查到什么”，不关心写到哪里：媒体服务器写入见 mediaserver.py，
-以后增加 NFO 演职人员刮削时，可以把 NFO 中的 <actor> 转成 PersonRef 后复用同一个解析器。
+这里只负责“查到什么”，不关心写到哪里：媒体服务器写入见 mediaserver.py，NFO 写入见 nfo.py。
 """
 
 import random

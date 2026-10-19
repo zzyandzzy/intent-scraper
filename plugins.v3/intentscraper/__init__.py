@@ -21,11 +21,13 @@ from app.schemas.types import EventType
 from app.sdk.media import resolve_media_identity
 from app.sdk.utilities import SystemUtils
 
-from .library import LibraryScrapingChain, is_trickplay_path
+from .library import SCRAPE_ITEMS, LibraryScrapingChain, build_policies, is_trickplay_path
 from .mediaserver import MediaServerPersonScraper, RealtimeGuard
 from .network import (
-    DEFAULT_IMAGE_DOMAINS, ImageDownloader, check_proxy, parse_domains, parse_proxy, patch_tmdb_proxy, use_proxy
+    DEFAULT_IMAGE_DOMAINS, ImageDownloader, check_proxy, parse_domains, parse_proxy, patch_fanart_proxy,
+    patch_tmdb_proxy, use_proxy
 )
+from .nfo import ACTOR_THUMB_LOCAL, ACTOR_THUMB_URL, NfoActorWriter, parse_path_mapping
 from .person import PERSON_TYPE_ALL, PERSON_TYPE_NAME, PERSON_TYPE_ROLE, PersonResolver
 
 
@@ -35,11 +37,11 @@ class IntentScraper(_PluginBase):
     # 插件名称
     plugin_name = "媒体库刮削增强"
     # 插件描述
-    plugin_desc = "定时对媒体库进行刮削，补齐缺失元数据、图片和演职人员中文信息，支持独立代理、图片下载重试和备用域名。"
+    plugin_desc = "定时对媒体库进行刮削，补齐电影、剧集、季和集的NFO与全部图片，演员中文化并保存头像，支持独立代理、图片下载重试和备用域名。"
     # 插件图标
     plugin_icon = "scraper.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "intent"
     # 作者主页
@@ -61,6 +63,12 @@ class IntentScraper(_PluginBase):
     _mode = ""
     _scraper_paths = ""
     _exclude_paths = ""
+    # 刮削内容
+    _scrape_items: List[str] = list(SCRAPE_ITEMS)
+    # NFO 演职人员
+    _nfo_actor = True
+    _actor_thumb = ACTOR_THUMB_LOCAL
+    _actor_path_mapping = ""
     # 演职人员刮削
     _person_enabled = False
     _person_realtime = False
@@ -80,6 +88,9 @@ class IntentScraper(_PluginBase):
     _event = Event()
     # 实时演职人员刮削防重
     _realtime_guard = RealtimeGuard()
+    # 覆盖模式
+    _mode_force_all = "force_all"
+    _mode_force_nfo = "force_nfo"
     # 刮削目标类型
     _target_dir = "dir"
     _target_file = "file"
@@ -95,6 +106,11 @@ class IntentScraper(_PluginBase):
             self._mode = config.get("mode") or ""
             self._scraper_paths = config.get("scraper_paths") or ""
             self._exclude_paths = config.get("exclude_paths") or ""
+            scrape_items = config.get("scrape_items")
+            self._scrape_items = list(SCRAPE_ITEMS) if scrape_items is None else list(scrape_items)
+            self._nfo_actor = config.get("nfo_actor", True)
+            self._actor_thumb = config.get("actor_thumb") or ACTOR_THUMB_LOCAL
+            self._actor_path_mapping = config.get("actor_path_mapping") or ""
             self._person_enabled = config.get("person_enabled") or False
             self._person_realtime = config.get("person_realtime") or False
             self._person_type = config.get("person_type") or PERSON_TYPE_ALL
@@ -109,6 +125,11 @@ class IntentScraper(_PluginBase):
 
         if self._proxy:
             patch_tmdb_proxy()
+            patch_fanart_proxy()
+
+        # 刮削内容由插件控制，不再依赖系统的刮削开关
+        LibraryScrapingChain.policies = build_policies(self._scrape_items,
+                                                       nfo_overwrite=self._mode == self._mode_force_nfo)
 
         # 媒体库图片和演职人员头像共用同一个下载器
         self._downloader = ImageDownloader(
@@ -148,6 +169,10 @@ class IntentScraper(_PluginBase):
             "mode": self._mode,
             "scraper_paths": self._scraper_paths,
             "exclude_paths": self._exclude_paths,
+            "scrape_items": self._scrape_items,
+            "nfo_actor": self._nfo_actor,
+            "actor_thumb": self._actor_thumb,
+            "actor_path_mapping": self._actor_path_mapping,
             "person_enabled": self._person_enabled,
             "person_realtime": self._person_realtime,
             "person_type": self._person_type,
@@ -262,6 +287,7 @@ class IntentScraper(_PluginBase):
                                             'label': '覆盖模式',
                                             'items': [
                                                 {'title': '不覆盖已有元数据', 'value': ''},
+                                                {'title': '覆盖NFO，图片仅补缺', 'value': 'force_nfo'},
                                                 {'title': '覆盖所有元数据和图片', 'value': 'force_all'},
                                             ]
                                         }
@@ -347,6 +373,129 @@ class IntentScraper(_PluginBase):
                                             'variant': 'tonal',
                                             'text': '刮削路径后拼接#电视剧/电影，强制指定该媒体路径媒体类型。'
                                                     '不加默认根据文件名自动识别媒体类型。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'multiple': True,
+                                            'chips': True,
+                                            'model': 'scrape_items',
+                                            'label': '刮削内容',
+                                            'items': [
+                                                {'title': 'NFO', 'value': 'nfo'},
+                                                {'title': '海报', 'value': 'poster'},
+                                                {'title': '背景图', 'value': 'backdrop'},
+                                                {'title': 'Logo', 'value': 'logo'},
+                                                {'title': '光盘图', 'value': 'disc'},
+                                                {'title': '横幅图', 'value': 'banner'},
+                                                {'title': '缩略图', 'value': 'thumb'},
+                                                {'title': '透明艺术图', 'value': 'clearart'},
+                                                {'title': '横版缩略图', 'value': 'landscape'},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'nfo_actor',
+                                            'label': 'NFO演员中文化'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'actor_thumb',
+                                            'label': 'NFO演员头像',
+                                            'items': [
+                                                {'title': '下载到本地 .actors 目录', 'value': ACTOR_THUMB_LOCAL},
+                                                {'title': '保留远程图片地址', 'value': ACTOR_THUMB_URL},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'actor_path_mapping',
+                                            'label': '演员头像路径映射',
+                                            'rows': 2,
+                                            'placeholder': '每一行一个映射：MoviePilot路径:媒体服务器路径，例如 /media:/data'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '电影、电视剧、季和集按所选内容刮削，不再使用系统设置中的刮削开关。'
+                                                    'Logo、光盘图、横幅图、透明艺术图和季横幅/缩略图来自Fanart，需在系统设置中启用Fanart，电视剧还需要有TVDB ID。'
+                                                    'NFO演员会从TMDB和豆瓣获取中文名称和饰演角色；头像下载到电影目录或剧集根目录的 .actors 中，'
+                                                    '并把NFO中的头像地址改为媒体服务器能访问的路径，MoviePilot与媒体服务器的媒体目录不同时请填写路径映射。'
                                         }
                                     }
                                 ]
@@ -628,6 +777,10 @@ class IntentScraper(_PluginBase):
             "mode": "",
             "scraper_paths": "",
             "exclude_paths": "",
+            "scrape_items": list(SCRAPE_ITEMS),
+            "nfo_actor": True,
+            "actor_thumb": ACTOR_THUMB_LOCAL,
+            "actor_path_mapping": "",
             "person_enabled": False,
             "person_realtime": False,
             "person_type": PERSON_TYPE_ALL,
@@ -655,18 +808,49 @@ class IntentScraper(_PluginBase):
         if proxies:
             if not patch_tmdb_proxy():
                 logger.warn("TMDB 识别仍使用系统代理")
+            if not patch_fanart_proxy():
+                logger.warn("Fanart 图片仍使用系统代理")
             check_proxy(proxies)
+        # 本轮人物信息在 NFO 和媒体服务器刮削间共用，同一个人只查询一次
+        resolver = PersonResolver(chain=self.chain, stop_event=self._event)
         with use_proxy(proxies):
             if self._scraper_paths:
-                self.__run_libraryscraper()
+                self.__check_fanart()
+                LibraryScrapingChain.nfo_writer = self.__new_nfo_writer(resolver)
+                try:
+                    self.__run_libraryscraper()
+                finally:
+                    LibraryScrapingChain.nfo_writer = None
             if self._person_enabled and not self._event.is_set():
-                self.__new_person_scraper().scrape_library()
+                self.__new_person_scraper(resolver).scrape_library()
 
-    def __new_person_scraper(self) -> MediaServerPersonScraper:
+    def __check_fanart(self):
+        """Logo、光盘图、横幅图、透明艺术图和季图片只能从 Fanart 获取，未启用时提前提示。"""
+        fanart_items = {"logo", "disc", "banner", "clearart"}.intersection(self._scrape_items)
+        if fanart_items and not getattr(settings, "FANART_ENABLE", True):
+            logger.warn("系统设置中未启用 Fanart，Logo、光盘图、横幅图、透明艺术图和季横幅/缩略图将无法刮削")
+
+    def __new_nfo_writer(self, resolver: PersonResolver) -> Optional[NfoActorWriter]:
+        """创建本轮 NFO 演职人员处理器，不需要处理演员时返回 None。"""
+        if "nfo" not in self._scrape_items:
+            return None
+        if not self._nfo_actor and self._actor_thumb != ACTOR_THUMB_LOCAL:
+            return None
+        return NfoActorWriter(
+            storagechain=LibraryScrapingChain().storagechain,
+            downloader=self._downloader,
+            resolver=resolver,
+            localize=bool(self._nfo_actor),
+            thumb_mode=self._actor_thumb,
+            path_mappings=parse_path_mapping(self._actor_path_mapping),
+            overwrite_images=self._mode == self._mode_force_all,
+        )
+
+    def __new_person_scraper(self, resolver: Optional[PersonResolver] = None) -> MediaServerPersonScraper:
         """创建一轮演职人员刮削任务，人物缓存只在本轮内有效。"""
         return MediaServerPersonScraper(
             chain=self.chain,
-            resolver=PersonResolver(chain=self.chain, stop_event=self._event),
+            resolver=resolver or PersonResolver(chain=self.chain, stop_event=self._event),
             downloader=self._downloader,
             mediaservers=self._mediaservers,
             person_type=self._person_type,
@@ -948,7 +1132,7 @@ class IntentScraper(_PluginBase):
                 modify_time=path.stat().st_mtime,
             ),
             mediainfo=mediainfo,
-            overwrite=True if self._mode else False
+            overwrite=self._mode == self._mode_force_all
         )
         logger.info(f"{path} 刮削完成")
 

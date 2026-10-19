@@ -1,7 +1,7 @@
 """
 插件网络层：插件代理、TMDB 代理挂载和带重试的图片下载器。
 
-媒体库刮削、演职人员刮削（以及以后的 NFO 演职人员刮削）共用这里的代理与下载能力。
+媒体库刮削、NFO 演职人员和媒体服务器演职人员刮削共用这里的代理与下载能力。
 """
 
 import os
@@ -87,6 +87,40 @@ def patch_tmdb_proxy() -> bool:
 
     _request_once._intentscraper_patched = True
     TMDb._request_once = _request_once
+    return True
+
+
+def patch_fanart_proxy() -> bool:
+    """
+    让 Fanart 模块在插件刮削线程内改走插件代理。
+
+    logo、光盘图、横幅图、缩略图和季图片都来自 Fanart，Fanart 模块固定使用系统代理请求，
+    这里替换其模块内的 RequestUtils：只有当前线程设置了插件代理时才改用插件代理，其余调用保持原样。
+
+    :return: 是否已成功挂载
+    """
+    try:
+        from app.modules import fanart
+    except Exception as err:
+        logger.warn(f"无法加载 Fanart 模块，Fanart 图片仍使用系统代理：{err}")
+        return False
+    original = getattr(fanart, "RequestUtils", None)
+    if original is None:
+        logger.warn("当前 MoviePilot 版本的 Fanart 模块不兼容，Fanart 图片仍使用系统代理")
+        return False
+    if getattr(original, "_intentscraper_patched", False):
+        return True
+
+    class _ProxyRequestUtils(original):
+        _intentscraper_patched = True
+
+        def __init__(self, *args, **kwargs):
+            proxies = current_proxies()
+            if proxies:
+                kwargs["proxies"] = proxies
+            super().__init__(*args, **kwargs)
+
+    fanart.RequestUtils = _ProxyRequestUtils
     return True
 
 
