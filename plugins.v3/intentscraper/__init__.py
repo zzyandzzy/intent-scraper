@@ -1,302 +1,45 @@
-import os
-import threading
-import time
-from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from threading import Event
-from typing import Iterator, List, Tuple, Dict, Any, Optional
-from urllib.parse import urlsplit, urlunsplit
+from typing import List, Tuple, Dict, Any, Optional
 
 import pytz
-import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app import schemas
-from app.chain.scraping import ScrapingChain
 from app.sdk.config import settings
+from app.sdk.events import eventmanager, Event as PluginEvent
 from app.sdk.media import MetaInfoPath
 from app.db.oper.transferhistory import TransferHistoryOper
 from app.sdk.media import NfoReader
 from app.sdk.logging import logger
-from app.sdk.network import RequestUtils
+from app.sdk.services import MediaServerHelper
 from app.plugins import _PluginBase
 from app.schemas import MediaSource, MediaType
+from app.schemas.types import EventType
 from app.sdk.media import resolve_media_identity
 from app.sdk.utilities import SystemUtils
 
-current_umask = os.umask(0)
-os.umask(current_umask)
-
-# 默认的 TMDB 图片备用域名，取自 MoviePilot 默认 SECURITY_IMAGE_DOMAINS 中的 TMDB 镜像
-DEFAULT_IMAGE_DOMAINS = "image.tmdb.org\nimages.tmdb.org\nstatic-mdb.v.geilijiasu.com"
-
-
-# 插件代理只对当前刮削线程生效，不影响整理、订阅等系统任务
-_proxy_context = threading.local()
-
-
-def _current_proxies() -> Optional[dict]:
-    """返回当前线程的插件代理，未在插件刮削中时为 None。"""
-    return getattr(_proxy_context, "proxies", None)
-
-
-@contextmanager
-def _use_proxy(proxies: Optional[dict]) -> Iterator[None]:
-    """在当前线程内启用插件代理，TMDB 请求复用同一会话以减少代理握手。"""
-    if not proxies:
-        yield
-        return
-    _proxy_context.proxies = proxies
-    _proxy_context.session = requests.Session()
-    try:
-        yield
-    finally:
-        _proxy_context.session.close()
-        _proxy_context.proxies = None
-        _proxy_context.session = None
-
-
-def _patch_tmdb_proxy() -> bool:
-    """
-    让主程序 TMDB 客户端在插件刮削线程内改走插件代理。
-
-    主程序 TMDb 客户端在创建时读取系统代理并固定在会话上，插件无法通过参数传入代理，
-    因此包装其单次请求方法：只有当前线程设置了插件代理时才替换请求客户端，其余调用保持原样。
-
-    :return: 是否已成功挂载
-    """
-    try:
-        from app.modules.themoviedb.tmdbv3api.tmdb import TMDb
-    except Exception as err:
-        logger.warn(f"无法加载 TMDB 客户端，插件代理仅对图片下载生效：{err}")
-        return False
-    original = getattr(TMDb, "_request_once", None)
-    if original is None:
-        logger.warn("当前 MoviePilot 版本的 TMDB 客户端不兼容，插件代理仅对图片下载生效")
-        return False
-    if getattr(original, "_intentscraper_patched", False):
-        return True
-
-    def _request_once(self, method, url, data, json):
-        proxies = _current_proxies()
-        if not proxies:
-            return original(self, method, url, data, json)
-        req = RequestUtils(
-            ua=settings.NORMAL_USER_AGENT,
-            session=_proxy_context.session,
-            proxies=proxies,
-        )
-        if method == "GET":
-            return req.get_res(url, params=data, json=json)
-        return req.post_res(url, data=data, json=json)
-
-    _request_once._intentscraper_patched = True
-    TMDb._request_once = _request_once
-    return True
-
-
-def _parse_proxy(value: Optional[str]) -> Optional[dict]:
-    """把代理地址转换为 requests 代理映射，未填写协议时按 http 处理。"""
-    value = (value or "").strip()
-    if not value:
-        return None
-    if "://" not in value:
-        value = f"http://{value}"
-    return {"http": value, "https": value}
-
-
-def _is_trickplay_path(path: Path) -> bool:
-    """按目录路径分量排除 Jellyfin 预览缓存及其子目录，保留同名媒体文件。"""
-    return any(parent.name.lower().endswith(".trickplay") for parent in path.parents) or (
-        path.name.lower().endswith(".trickplay") and path.is_dir()
-    )
-
-
-class _ImageDownloadError(Exception):
-    """
-    单次图片下载失败。
-
-    :param reason: 失败原因
-    :param retryable: 同一地址是否值得重试，404 等确定性错误无需重试
-    :param retry_after: 服务端要求的等待秒数
-    """
-
-    def __init__(self, reason: str, retryable: bool = True, retry_after: Optional[float] = None):
-        super().__init__(reason)
-        self.retryable = retryable
-        self.retry_after = retry_after
-
-
-class _LibraryScrapingChain(ScrapingChain):
-    """
-    为媒体库刮削的递归调用保留 Jellyfin 预览目录排除规则，并替换图片下载逻辑。
-
-    主程序的图片下载只请求一次，网络抖动、TMDB 限流、代理异常或图片域名被阻断时，
-    只会输出“图片下载失败”且不重试；这里改为多域名、多线路、带重试和完整性校验的下载。
-    """
-
-    # 以下参数由插件 init_plugin 写入
-    retry_times: int = 3
-    timeout: int = 30
-    connect_timeout: int = 10
-    image_domains: List[str] = DEFAULT_IMAGE_DOMAINS.split("\n")
-    direct_fallback: bool = True
-
-    # 这些状态码说明服务端暂时不可用，值得重试
-    _retryable_status = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
-
-    def scrape_metadata(self, fileitem, *args, **kwargs):
-        """在每次递归写入前检查目录，防止带季号的缓存被当作剧集目录。"""
-        if fileitem and _is_trickplay_path(Path(fileitem.path)):
-            return False, "跳过 Jellyfin 预览缓存目录"
-        return super().scrape_metadata(fileitem, *args, **kwargs)
-
-    def _download_and_save_image(self, fileitem: schemas.FileItem, path: Path, url: str) -> None:
-        """
-        下载图片并保存到文件，依次尝试各图片域名与网络线路，每个组合失败后按退避时间重试。
-
-        :param fileitem: 关联的媒体文件项
-        :param path: 图片文件路径
-        :param url: 图片下载URL
-        """
-        if not fileitem or not url or not path:
-            return
-        errors = []
-        for candidate_url in self._candidate_urls(url):
-            for proxies in self._candidate_proxies():
-                route = "代理" if proxies else "直连"
-                for attempt in range(1, self.retry_times + 1):
-                    tmp_file_path = None
-                    try:
-                        logger.info(f"正在下载图片：{candidate_url}（{route}，第 {attempt} 次）...")
-                        tmp_file_path = self._fetch_image(candidate_url, proxies=proxies, suffix=path.suffix)
-                        item = self.storagechain.upload_file(
-                            fileitem=fileitem, path=tmp_file_path, new_name=path.name
-                        )
-                        if item:
-                            logger.info(f"已保存图片：{item.path}")
-                        else:
-                            logger.warn(f"图片保存失败：{path}")
-                        return
-                    except _ImageDownloadError as err:
-                        errors.append(f"{candidate_url}（{route}）：{err}")
-                        logger.warn(f"{candidate_url} 图片下载失败（{route}，第 {attempt} 次）：{err}")
-                        if not err.retryable:
-                            break
-                        if attempt < self.retry_times:
-                            time.sleep(err.retry_after or min(2 ** attempt, 10))
-                    finally:
-                        self._cleanup_temp_file(tmp_file_path)
-        logger.error(f"{url} 图片下载失败，已尝试所有地址和线路：{'；'.join(errors[-3:])}")
-
-    def _candidate_urls(self, url: str) -> List[str]:
-        """
-        生成候选下载地址：原地址优先，TMDB 图片再依次替换为各备用域名。
-        """
-        candidates = [url]
-        parts = urlsplit(url)
-        tmdb_domains = [d for d in self.image_domains if d]
-        known_domains = set(tmdb_domains) | {"image.tmdb.org", settings.TMDB_IMAGE_DOMAIN}
-        if parts.hostname in known_domains and parts.path.startswith("/t/p/"):
-            for domain in [settings.TMDB_IMAGE_DOMAIN] + tmdb_domains:
-                candidate = urlunsplit(parts._replace(netloc=domain))
-                if candidate not in candidates:
-                    candidates.append(candidate)
-        return candidates
-
-    def _candidate_proxies(self) -> List[Optional[dict]]:
-        """
-        生成候选网络线路：优先插件代理，其次系统代理，开启直连兜底时再尝试直连。
-        """
-        proxy = _current_proxies() or self.runtime_config.proxy
-        if not proxy:
-            return [None]
-        return [proxy, None] if self.direct_fallback else [proxy]
-
-    def _fetch_image(self, url: str, proxies: Optional[dict], suffix: str) -> Path:
-        """
-        流式下载单个图片到临时文件，并校验状态码、类型和长度。
-
-        :param url: 图片地址
-        :param proxies: 代理设置，None 为直连
-        :param suffix: 临时文件后缀
-        :return: 下载完成的临时文件路径，由调用方清理
-        :raises _ImageDownloadError: 下载失败或内容不完整
-        """
-        request = RequestUtils(
-            proxies=proxies,
-            ua=self.runtime_config.normal_user_agent,
-            referer="https://movie.douban.com/" if "doubanio.com" in url else None,
-        )
-        tmp_file_path = None
-        try:
-            with request.get_stream(
-                    url,
-                    timeout=(self.connect_timeout, self.timeout),
-                    raise_exception=True,
-            ) as r:
-                if r is None:
-                    raise _ImageDownloadError("未获取到响应")
-                if r.status_code != 200:
-                    raise _ImageDownloadError(
-                        f"HTTP {r.status_code}",
-                        retryable=r.status_code in self._retryable_status,
-                        retry_after=self._parse_retry_after(r.headers.get("Retry-After")),
-                    )
-                content_type = r.headers.get("Content-Type", "")
-                if content_type and not content_type.lower().startswith(("image/", "application/octet-stream")):
-                    raise _ImageDownloadError(f"返回内容不是图片：{content_type}")
-                expected_length = r.headers.get("Content-Length")
-                received = 0
-                # delete_on_close 是 Python 3.12 才支持的参数，使用 delete=False 后手动清理以兼容低版本。
-                with NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                    tmp_file_path = Path(tmp_file.name)
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            tmp_file.write(chunk)
-                            received += len(chunk)
-                    tmp_file.flush()
-                if not received:
-                    raise _ImageDownloadError("图片内容为空")
-                # 未压缩传输时可以用 Content-Length 判断连接是否中途断开
-                if (expected_length and expected_length.isdigit() and not r.headers.get("Content-Encoding")
-                        and received != int(expected_length)):
-                    raise _ImageDownloadError(f"图片不完整：{received}/{expected_length} 字节")
-            # 刮削的图片只需要读写权限
-            tmp_file_path.chmod(0o666 & ~current_umask)
-            return tmp_file_path
-        except _ImageDownloadError:
-            self._cleanup_temp_file(tmp_file_path)
-            raise
-        except requests.exceptions.RequestException as err:
-            self._cleanup_temp_file(tmp_file_path)
-            raise _ImageDownloadError(f"{type(err).__name__}：{err}")
-        except Exception as err:
-            self._cleanup_temp_file(tmp_file_path)
-            raise _ImageDownloadError(str(err), retryable=False)
-
-    @staticmethod
-    def _parse_retry_after(value: Optional[str]) -> Optional[float]:
-        """解析 Retry-After 秒数，最长等待 30 秒，避免阻塞整个刮削任务。"""
-        if value and value.strip().isdigit():
-            return min(float(value.strip()), 30)
-        return None
+from .library import LibraryScrapingChain, is_trickplay_path
+from .mediaserver import MediaServerPersonScraper, RealtimeGuard
+from .network import (
+    DEFAULT_IMAGE_DOMAINS, ImageDownloader, check_proxy, parse_domains, parse_proxy, patch_tmdb_proxy, use_proxy
+)
+from .person import PERSON_TYPE_ALL, PERSON_TYPE_NAME, PERSON_TYPE_ROLE, PersonResolver
 
 
 class IntentScraper(_PluginBase):
-    """定时补齐媒体库元数据，跳过媒体服务器生成的预览缓存，并加固图片下载。"""
+    """定时补齐媒体库元数据和演职人员中文信息，跳过媒体服务器生成的预览缓存，并加固图片下载。"""
 
     # 插件名称
     plugin_name = "媒体库刮削增强"
     # 插件描述
-    plugin_desc = "定时对媒体库进行刮削，补齐缺失元数据和图片，支持独立代理、图片下载重试和备用域名。"
+    plugin_desc = "定时对媒体库进行刮削，补齐缺失元数据、图片和演职人员中文信息，支持独立代理、图片下载重试和备用域名。"
     # 插件图标
     plugin_icon = "scraper.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "intent"
     # 作者主页
@@ -318,15 +61,25 @@ class IntentScraper(_PluginBase):
     _mode = ""
     _scraper_paths = ""
     _exclude_paths = ""
+    # 演职人员刮削
+    _person_enabled = False
+    _person_realtime = False
+    _person_type = PERSON_TYPE_ALL
+    _person_remove_nozh = False
+    _mediaservers: List[str] = []
+    _delay = 30
     # 图片下载
     _retry_times = 3
     _timeout = 30
     _image_domains = DEFAULT_IMAGE_DOMAINS
     _direct_fallback = True
+    _downloader = ImageDownloader()
     # 插件代理，留空使用系统代理
     _proxy = ""
     # 退出事件
     _event = Event()
+    # 实时演职人员刮削防重
+    _realtime_guard = RealtimeGuard()
     # 刮削目标类型
     _target_dir = "dir"
     _target_file = "file"
@@ -342,6 +95,12 @@ class IntentScraper(_PluginBase):
             self._mode = config.get("mode") or ""
             self._scraper_paths = config.get("scraper_paths") or ""
             self._exclude_paths = config.get("exclude_paths") or ""
+            self._person_enabled = config.get("person_enabled") or False
+            self._person_realtime = config.get("person_realtime") or False
+            self._person_type = config.get("person_type") or PERSON_TYPE_ALL
+            self._person_remove_nozh = config.get("person_remove_nozh") or False
+            self._mediaservers = config.get("mediaservers") or []
+            self._delay = self.__to_int(config.get("delay"), 30, 0, 3600)
             self._retry_times = self.__to_int(config.get("retry_times"), 3, 1, 10)
             self._timeout = self.__to_int(config.get("timeout"), 30, 5, 300)
             self._image_domains = config.get("image_domains") or DEFAULT_IMAGE_DOMAINS
@@ -349,17 +108,16 @@ class IntentScraper(_PluginBase):
             self._proxy = (config.get("proxy") or "").strip()
 
         if self._proxy:
-            _patch_tmdb_proxy()
+            patch_tmdb_proxy()
 
-        # 图片下载参数写入刮削链
-        _LibraryScrapingChain.retry_times = self._retry_times
-        _LibraryScrapingChain.timeout = self._timeout
-        # 兼容填写 https://域名/ 的形式
-        _LibraryScrapingChain.image_domains = [
-            urlsplit(d.strip() if "://" in d else f"//{d.strip()}").netloc
-            for d in self._image_domains.split("\n") if d.strip()
-        ]
-        _LibraryScrapingChain.direct_fallback = bool(self._direct_fallback)
+        # 媒体库图片和演职人员头像共用同一个下载器
+        self._downloader = ImageDownloader(
+            retry_times=self._retry_times,
+            timeout=self._timeout,
+            image_domains=parse_domains(self._image_domains),
+            direct_fallback=bool(self._direct_fallback),
+        )
+        LibraryScrapingChain.downloader = self._downloader
 
         # 停止现有任务
         self.stop_service()
@@ -370,28 +128,38 @@ class IntentScraper(_PluginBase):
             if self._onlyonce:
                 logger.info(f"媒体库刮削服务，立即运行一次")
                 self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-                self._scheduler.add_job(func=self.__libraryscraper, trigger='date',
+                self._scheduler.add_job(func=self.__run_tasks, trigger='date',
                                         run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
                                         name="媒体库刮削")
                 # 关闭一次性开关
                 self._onlyonce = False
-                self.update_config({
-                    "onlyonce": False,
-                    "enabled": self._enabled,
-                    "cron": self._cron,
-                    "mode": self._mode,
-                    "scraper_paths": self._scraper_paths,
-                    "exclude_paths": self._exclude_paths,
-                    "retry_times": self._retry_times,
-                    "timeout": self._timeout,
-                    "image_domains": self._image_domains,
-                    "direct_fallback": self._direct_fallback,
-                    "proxy": self._proxy
-                })
+                self.__update_config()
                 if self._scheduler.get_jobs():
                     # 启动服务
                     self._scheduler.print_jobs()
                     self._scheduler.start()
+
+    def __update_config(self):
+        """保存当前配置。"""
+        self.update_config({
+            "onlyonce": self._onlyonce,
+            "enabled": self._enabled,
+            "cron": self._cron,
+            "mode": self._mode,
+            "scraper_paths": self._scraper_paths,
+            "exclude_paths": self._exclude_paths,
+            "person_enabled": self._person_enabled,
+            "person_realtime": self._person_realtime,
+            "person_type": self._person_type,
+            "person_remove_nozh": self._person_remove_nozh,
+            "mediaservers": self._mediaservers,
+            "delay": self._delay,
+            "retry_times": self._retry_times,
+            "timeout": self._timeout,
+            "image_domains": self._image_domains,
+            "direct_fallback": self._direct_fallback,
+            "proxy": self._proxy
+        })
 
     def get_state(self) -> bool:
         """返回定时刮削服务的启用状态。"""
@@ -422,7 +190,7 @@ class IntentScraper(_PluginBase):
                 "id": "IntentScraper",
                 "name": "媒体库刮削",
                 "trigger": CronTrigger.from_crontab(self._cron),
-                "func": self.__libraryscraper,
+                "func": self.__run_tasks,
                 "kwargs": {}
             }]
         elif self._enabled:
@@ -430,7 +198,7 @@ class IntentScraper(_PluginBase):
                 "id": "IntentScraper",
                 "name": "媒体库刮削",
                 "trigger": CronTrigger.from_crontab("0 0 */7 * *"),
-                "func": self.__libraryscraper,
+                "func": self.__run_tasks,
                 "kwargs": {}
             }]
         return []
@@ -596,6 +364,148 @@ class IntentScraper(_PluginBase):
                                 },
                                 'content': [
                                     {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'person_enabled',
+                                            'label': '刮削演职人员',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'person_realtime',
+                                            'label': '入库后实时刮削演职人员',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'person_remove_nozh',
+                                            'label': '删除非中文演员',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'multiple': True,
+                                            'chips': True,
+                                            'clearable': True,
+                                            'model': 'mediaservers',
+                                            'label': '媒体服务器',
+                                            'items': [{"title": config.name, "value": config.name}
+                                                      for config in MediaServerHelper().get_configs().values()]
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'person_type',
+                                            'label': '演职人员刮削条件',
+                                            'items': [
+                                                {'title': '演员或角色非中文', 'value': PERSON_TYPE_ALL},
+                                                {'title': '演员非中文', 'value': PERSON_TYPE_NAME},
+                                                {'title': '角色非中文', 'value': PERSON_TYPE_ROLE},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'delay',
+                                            'label': '入库延迟时间（秒）',
+                                            'type': 'number',
+                                            'placeholder': '等待媒体服务器入库，默认30'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '演职人员刮削从TMDB和豆瓣获取中文名称、饰演角色、简介和头像，'
+                                                    '写入所选媒体服务器（支持Emby、Jellyfin），按执行周期扫描全库；'
+                                                    '开启实时刮削后，整理入库时也会处理对应媒体。'
+                                                    '头像与媒体库图片使用相同的代理、重试和备用域名设置。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
                                         'component': 'VTextField',
                                         'props': {
                                             'model': 'retry_times',
@@ -718,6 +628,12 @@ class IntentScraper(_PluginBase):
             "mode": "",
             "scraper_paths": "",
             "exclude_paths": "",
+            "person_enabled": False,
+            "person_realtime": False,
+            "person_type": PERSON_TYPE_ALL,
+            "person_remove_nozh": False,
+            "mediaservers": [],
+            "delay": 30,
             "retry_times": 3,
             "timeout": 30,
             "image_domains": DEFAULT_IMAGE_DOMAINS,
@@ -729,33 +645,61 @@ class IntentScraper(_PluginBase):
         """本插件不提供详情页面。"""
         pass
 
-    def __libraryscraper(self):
+    def __run_tasks(self):
         """
-        开始刮削媒体库，配置了插件代理时整个刮削过程都在代理上下文中执行。
+        定时任务：先刮削媒体库文件，再刮削媒体服务器演职人员，配置了插件代理时整个过程都在代理上下文中执行。
         """
-        if not self._scraper_paths:
+        if not self._scraper_paths and not self._person_enabled:
             return
-        proxies = _parse_proxy(self._proxy)
+        proxies = parse_proxy(self._proxy)
         if proxies:
-            if not _patch_tmdb_proxy():
+            if not patch_tmdb_proxy():
                 logger.warn("TMDB 识别仍使用系统代理")
-            self.__check_proxy(proxies)
-        with _use_proxy(proxies):
-            self.__run_libraryscraper()
+            check_proxy(proxies)
+        with use_proxy(proxies):
+            if self._scraper_paths:
+                self.__run_libraryscraper()
+            if self._person_enabled and not self._event.is_set():
+                self.__new_person_scraper().scrape_library()
 
-    @staticmethod
-    def __check_proxy(proxies: dict):
-        """通过插件代理访问 TMDB API 域名，提前在日志中给出代理是否可用的结论。"""
-        url = f"https://{settings.TMDB_API_DOMAIN}/3/configuration"
-        # 日志中不输出代理账号密码
-        proxy_parts = urlsplit(proxies.get("https"))
-        proxy_desc = f"{proxy_parts.scheme}://{proxy_parts.hostname}:{proxy_parts.port}"
-        try:
-            # 未带 API Key 会返回 401，只要拿到响应就说明代理链路是通的
-            res = RequestUtils(proxies=proxies, timeout=20).get_res(url, raise_exception=True)
-            logger.info(f"插件代理 {proxy_desc} 连通性检查成功：{url} 返回 HTTP {res.status_code}")
-        except requests.exceptions.RequestException as err:
-            logger.error(f"插件代理 {proxy_desc} 连通性检查失败，请检查代理地址：{type(err).__name__}：{err}")
+    def __new_person_scraper(self) -> MediaServerPersonScraper:
+        """创建一轮演职人员刮削任务，人物缓存只在本轮内有效。"""
+        return MediaServerPersonScraper(
+            chain=self.chain,
+            resolver=PersonResolver(chain=self.chain, stop_event=self._event),
+            downloader=self._downloader,
+            mediaservers=self._mediaservers,
+            person_type=self._person_type,
+            remove_nozh=self._person_remove_nozh,
+            stop_event=self._event,
+        )
+
+    @eventmanager.register([EventType.MetadataScrape, EventType.TransferComplete])
+    def scrape_person_rt(self, event: PluginEvent):
+        """
+        整理入库后实时刮削对应媒体的演职人员。
+        """
+        if not self._enabled or not self._person_enabled or not self._person_realtime:
+            return
+        if not event or not event.event_data:
+            return
+        event_data = event.event_data
+        # 已开启元数据刮削的整理事件由 MetadataScrape 统一处理，避免 TransferComplete 逐文件重复触发
+        if event.event_type == EventType.TransferComplete:
+            transferinfo = event_data.get("transferinfo")
+            if transferinfo and getattr(transferinfo, "need_scrape", False):
+                logger.debug("整理完成事件已开启元数据刮削，等待 MetadataScrape 事件处理演职人员")
+                return
+        mediainfo = event_data.get("mediainfo")
+        if not mediainfo:
+            return
+        # 等待媒体服务器扫描入库
+        if self._delay and self._event.wait(self._delay):
+            return
+        season = getattr(event_data.get("meta"), "begin_season", None)
+        with use_proxy(parse_proxy(self._proxy)):
+            self.__new_person_scraper().scrape_media(mediainfo=mediainfo, season=season,
+                                                     guard=self._realtime_guard)
 
     def __run_libraryscraper(self):
         """
@@ -790,7 +734,7 @@ class IntentScraper(_PluginBase):
                 if self._event.is_set():
                     logger.info(f"媒体库刮削服务停止")
                     return
-                if _is_trickplay_path(file_path):
+                if is_trickplay_path(file_path):
                     continue
                 # 排除目录
                 exclude_flag = False
@@ -865,7 +809,7 @@ class IntentScraper(_PluginBase):
         if not file_path or not scraper_path or not mtype:
             return None
 
-        if _is_trickplay_path(file_path):
+        if is_trickplay_path(file_path):
             return None
 
         rename_format = settings.TV_RENAME_FORMAT if mtype == MediaType.TV else settings.MOVIE_RENAME_FORMAT
@@ -935,7 +879,7 @@ class IntentScraper(_PluginBase):
         """
         刮削一个媒体目录或媒体文件
         """
-        if _is_trickplay_path(path):
+        if is_trickplay_path(path):
             return
 
         media_source, media_id = resolve_media_identity(
@@ -993,7 +937,7 @@ class IntentScraper(_PluginBase):
         item_path = str(path).replace("\\", "/")
         if target_type == self._target_dir:
             item_path = f"{item_path}/"
-        _LibraryScrapingChain().scrape_metadata(
+        LibraryScrapingChain().scrape_metadata(
             fileitem=schemas.FileItem(
                 storage="local",
                 type=target_type,
@@ -1021,7 +965,7 @@ class IntentScraper(_PluginBase):
             if self._event.is_set():
                 logger.info(f"媒体库刮削服务停止")
                 return
-            if _is_trickplay_path(child_file):
+            if is_trickplay_path(child_file):
                 continue
             child_mtype = mtype
             child_meta = MetaInfoPath(child_file)
