@@ -1,14 +1,15 @@
 {
   "IntentScraper": {
     "name": "媒体库刮削增强",
-    "description": "定时对媒体库进行刮削，补齐缺失元数据和图片，图片下载支持重试和备用域名。",
+    "description": "定时对媒体库进行刮削，补齐缺失元数据和图片，支持独立代理、图片下载重试和备用域名。",
     "labels": "刮削",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "scraper.png",
     "author": "intent",
     "level": 1,
     "release": true,
     "history": {
+      "v1.1.0": "新增插件代理：仅对本插件刮削生效（TMDB识别、元数据、图片下载），修复未配置系统代理时“无法连接TheMovieDb”；运行前检查代理连通性",
       "v1.0.0": "基于官方媒体库刮削 v3.1.2：修复图片下载失败（scraping.py - 图片下载失败），增加重试、TMDB备用域名、代理失败直连兜底、连接超时和完整性校验"
     },
     "system_version": ">=3.0.0"

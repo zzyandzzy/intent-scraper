@@ -1,10 +1,12 @@
 import os
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from threading import Event
-from typing import List, Tuple, Dict, Any, Optional
+from typing import Iterator, List, Tuple, Dict, Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import pytz
@@ -30,6 +32,80 @@ os.umask(current_umask)
 
 # 默认的 TMDB 图片备用域名，取自 MoviePilot 默认 SECURITY_IMAGE_DOMAINS 中的 TMDB 镜像
 DEFAULT_IMAGE_DOMAINS = "image.tmdb.org\nimages.tmdb.org\nstatic-mdb.v.geilijiasu.com"
+
+
+# 插件代理只对当前刮削线程生效，不影响整理、订阅等系统任务
+_proxy_context = threading.local()
+
+
+def _current_proxies() -> Optional[dict]:
+    """返回当前线程的插件代理，未在插件刮削中时为 None。"""
+    return getattr(_proxy_context, "proxies", None)
+
+
+@contextmanager
+def _use_proxy(proxies: Optional[dict]) -> Iterator[None]:
+    """在当前线程内启用插件代理，TMDB 请求复用同一会话以减少代理握手。"""
+    if not proxies:
+        yield
+        return
+    _proxy_context.proxies = proxies
+    _proxy_context.session = requests.Session()
+    try:
+        yield
+    finally:
+        _proxy_context.session.close()
+        _proxy_context.proxies = None
+        _proxy_context.session = None
+
+
+def _patch_tmdb_proxy() -> bool:
+    """
+    让主程序 TMDB 客户端在插件刮削线程内改走插件代理。
+
+    主程序 TMDb 客户端在创建时读取系统代理并固定在会话上，插件无法通过参数传入代理，
+    因此包装其单次请求方法：只有当前线程设置了插件代理时才替换请求客户端，其余调用保持原样。
+
+    :return: 是否已成功挂载
+    """
+    try:
+        from app.modules.themoviedb.tmdbv3api.tmdb import TMDb
+    except Exception as err:
+        logger.warn(f"无法加载 TMDB 客户端，插件代理仅对图片下载生效：{err}")
+        return False
+    original = getattr(TMDb, "_request_once", None)
+    if original is None:
+        logger.warn("当前 MoviePilot 版本的 TMDB 客户端不兼容，插件代理仅对图片下载生效")
+        return False
+    if getattr(original, "_intentscraper_patched", False):
+        return True
+
+    def _request_once(self, method, url, data, json):
+        proxies = _current_proxies()
+        if not proxies:
+            return original(self, method, url, data, json)
+        req = RequestUtils(
+            ua=settings.NORMAL_USER_AGENT,
+            session=_proxy_context.session,
+            proxies=proxies,
+        )
+        if method == "GET":
+            return req.get_res(url, params=data, json=json)
+        return req.post_res(url, data=data, json=json)
+
+    _request_once._intentscraper_patched = True
+    TMDb._request_once = _request_once
+    return True
+
+
+def _parse_proxy(value: Optional[str]) -> Optional[dict]:
+    """把代理地址转换为 requests 代理映射，未填写协议时按 http 处理。"""
+    value = (value or "").strip()
+    if not value:
+        return None
+    if "://" not in value:
+        value = f"http://{value}"
+    return {"http": value, "https": value}
 
 
 def _is_trickplay_path(path: Path) -> bool:
@@ -133,9 +209,9 @@ class _LibraryScrapingChain(ScrapingChain):
 
     def _candidate_proxies(self) -> List[Optional[dict]]:
         """
-        生成候选网络线路：配置了代理时先走代理，开启直连兜底时再尝试直连。
+        生成候选网络线路：优先插件代理，其次系统代理，开启直连兜底时再尝试直连。
         """
-        proxy = self.runtime_config.proxy
+        proxy = _current_proxies() or self.runtime_config.proxy
         if not proxy:
             return [None]
         return [proxy, None] if self.direct_fallback else [proxy]
@@ -216,11 +292,11 @@ class IntentScraper(_PluginBase):
     # 插件名称
     plugin_name = "媒体库刮削增强"
     # 插件描述
-    plugin_desc = "定时对媒体库进行刮削，补齐缺失元数据和图片，图片下载支持重试和备用域名。"
+    plugin_desc = "定时对媒体库进行刮削，补齐缺失元数据和图片，支持独立代理、图片下载重试和备用域名。"
     # 插件图标
     plugin_icon = "scraper.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "intent"
     # 作者主页
@@ -247,6 +323,8 @@ class IntentScraper(_PluginBase):
     _timeout = 30
     _image_domains = DEFAULT_IMAGE_DOMAINS
     _direct_fallback = True
+    # 插件代理，留空使用系统代理
+    _proxy = ""
     # 退出事件
     _event = Event()
     # 刮削目标类型
@@ -268,6 +346,10 @@ class IntentScraper(_PluginBase):
             self._timeout = self.__to_int(config.get("timeout"), 30, 5, 300)
             self._image_domains = config.get("image_domains") or DEFAULT_IMAGE_DOMAINS
             self._direct_fallback = config.get("direct_fallback", True)
+            self._proxy = (config.get("proxy") or "").strip()
+
+        if self._proxy:
+            _patch_tmdb_proxy()
 
         # 图片下载参数写入刮削链
         _LibraryScrapingChain.retry_times = self._retry_times
@@ -303,7 +385,8 @@ class IntentScraper(_PluginBase):
                     "retry_times": self._retry_times,
                     "timeout": self._timeout,
                     "image_domains": self._image_domains,
-                    "direct_fallback": self._direct_fallback
+                    "direct_fallback": self._direct_fallback,
+                    "proxy": self._proxy
                 })
                 if self._scheduler.get_jobs():
                     # 启动服务
@@ -587,6 +670,27 @@ class IntentScraper(_PluginBase):
                             {
                                 'component': 'VCol',
                                 'props': {
+                                    'cols': 12
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'proxy',
+                                            'label': '代理地址',
+                                            'placeholder': '例如 http://192.168.1.2:7890 或 socks5h://192.168.1.2:1080，留空使用系统代理'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
                                     'cols': 12,
                                 },
                                 'content': [
@@ -595,8 +699,10 @@ class IntentScraper(_PluginBase):
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': 'TMDB图片下载失败时，会按顺序替换为上面的域名重试；'
-                                                    '配置了代理时先走代理，失败后再直连。'
+                                            'text': '代理地址只对本插件的刮削生效（TMDB识别、元数据和图片下载），'
+                                                    '留空使用系统代理，支持 http:// 和 socks5h://。'
+                                                    'TMDB图片下载失败时，会按顺序替换为上面的域名重试；'
+                                                    '有代理时先走代理，失败后再直连。'
                                         }
                                     }
                                 ]
@@ -615,7 +721,8 @@ class IntentScraper(_PluginBase):
             "retry_times": 3,
             "timeout": 30,
             "image_domains": DEFAULT_IMAGE_DOMAINS,
-            "direct_fallback": True
+            "direct_fallback": True,
+            "proxy": ""
         }
 
     def get_page(self) -> List[dict]:
@@ -624,10 +731,36 @@ class IntentScraper(_PluginBase):
 
     def __libraryscraper(self):
         """
-        开始刮削媒体库
+        开始刮削媒体库，配置了插件代理时整个刮削过程都在代理上下文中执行。
         """
         if not self._scraper_paths:
             return
+        proxies = _parse_proxy(self._proxy)
+        if proxies:
+            if not _patch_tmdb_proxy():
+                logger.warn("TMDB 识别仍使用系统代理")
+            self.__check_proxy(proxies)
+        with _use_proxy(proxies):
+            self.__run_libraryscraper()
+
+    @staticmethod
+    def __check_proxy(proxies: dict):
+        """通过插件代理访问 TMDB API 域名，提前在日志中给出代理是否可用的结论。"""
+        url = f"https://{settings.TMDB_API_DOMAIN}/3/configuration"
+        # 日志中不输出代理账号密码
+        proxy_parts = urlsplit(proxies.get("https"))
+        proxy_desc = f"{proxy_parts.scheme}://{proxy_parts.hostname}:{proxy_parts.port}"
+        try:
+            # 未带 API Key 会返回 401，只要拿到响应就说明代理链路是通的
+            res = RequestUtils(proxies=proxies, timeout=20).get_res(url, raise_exception=True)
+            logger.info(f"插件代理 {proxy_desc} 连通性检查成功：{url} 返回 HTTP {res.status_code}")
+        except requests.exceptions.RequestException as err:
+            logger.error(f"插件代理 {proxy_desc} 连通性检查失败，请检查代理地址：{type(err).__name__}：{err}")
+
+    def __run_libraryscraper(self):
+        """
+        扫描刮削路径并逐个刮削
+        """
         # 排除目录
         exclude_paths = self._exclude_paths.split("\n")
         # 已选择的目录
